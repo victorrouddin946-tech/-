@@ -1,0 +1,348 @@
+cpp
+// r6_payload/dllmain.cpp
+// C++17 | MSVC | compiled as x64 DLL
+// Injected into RainbowSix.exe — reads r6_cfg.txt, enables selected features
+// Link: d3d11.lib dxgi.lib dwmapi.lib psapi.lib
+
+#include <windows.h>
+#include <psapi.h>
+#include <d3d11.h>
+#include <dwmapi.h>
+#include <tlhelp32.h>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <cmath>
+#include <filesystem>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "psapi.lib")
+
+// ── OFFSETS — update each patch from UC R6 thread ────────────────────────────
+namespace Off {
+    constexpr uintptr_t EntityList   = 0x47A5C20;
+    constexpr uintptr_t LocalPlayer  = 0x478E120;
+    constexpr uintptr_t ViewMatrix   = 0x47B1580;
+    constexpr uintptr_t ViewAngles   = 0x47B1480;
+    constexpr uintptr_t EntityHP     = 0x148;
+    constexpr uintptr_t EntityTeam   = 0x140;
+    constexpr uintptr_t EntityPos    = 0x160;
+    constexpr uintptr_t EntityName   = 0x220;
+    constexpr uintptr_t Recoil       = 0x4A0;
+    constexpr uintptr_t Spread       = 0x4A4;
+    constexpr uintptr_t FireRate     = 0x4B0;
+    constexpr int       MaxEntities  = 64;
+    constexpr uintptr_t Stride       = 0x8;
+}
+
+// ── TYPES ─────────────────────────────────────────────────────────────────────
+struct Vec3 { float x,y,z; };
+struct Vec2 { float x,y; };
+struct Angles { float pitch,yaw; };
+
+// ── FEATURE FLAGS ─────────────────────────────────────────────────────────────
+struct Features {
+    bool espBoxes       = false;
+    bool espHealth      = false;
+    bool espDistance    = false;
+    bool espSkeleton    = false;
+    bool aimbotClosest  = false;
+    bool aimbotSilent   = false;
+    bool noRecoil       = false;
+    bool rapidFire      = false;
+    bool noSpread       = false;
+    bool noFlash        = false;
+    bool speedBoost     = false;
+    bool lowGravity     = false;
+    bool wallhack       = false;
+    bool oneShotMult    = false;
+} g_features;
+
+// ── MEMORY HELPERS ────────────────────────────────────────────────────────────
+uintptr_t g_base = 0;
+
+template<typename T>
+T Rd(uintptr_t addr) {
+    T v{}; ReadProcessMemory(GetCurrentProcess(),(LPCVOID)addr,&v,sizeof(T),nullptr); return v;
+}
+template<typename T>
+void Wr(uintptr_t addr, T val) {
+    WriteProcessMemory(GetCurrentProcess(),(LPVOID)addr,&val,sizeof(T),nullptr);
+}
+
+// ── PATTERN SCAN ─────────────────────────────────────────────────────────────
+uintptr_t PatScan(const char* pat, const char* mask) {
+    MODULEINFO mi{};
+    GetModuleInformation(GetCurrentProcess(),GetModuleHandle(nullptr),&mi,sizeof(mi));
+    auto base=(uintptr_t)mi.lpBaseOfDll, size=mi.SizeOfImage;
+    size_t len=strlen(mask);
+    for(uintptr_t i=base;i<base+size-len;i++){
+        bool ok=true;
+        for(size_t j=0;j<len;j++) if(mask[j]=='x'&&((BYTE*)i)[j]!=(BYTE)pat[j]){ok=false;break;}
+        if(ok) return i;
+    }
+    return 0;
+}
+
+// ── WORLD TO SCREEN ───────────────────────────────────────────────────────────
+int g_SW=1920, g_SH=1080;
+
+bool W2S(float* vm, Vec3 w, Vec2& s) {
+    float clip_w = vm[12]*w.x + vm[13]*w.y + vm[14]*w.z + vm[15];
+    if(clip_w<.001f) return false;
+    s.x=(g_SW/2.f)+(g_SW/2.f)*(vm[0]*w.x+vm[1]*w.y+vm[2]*w.z+vm[3])/clip_w;
+    s.y=(g_SH/2.f)-(g_SH/2.f)*(vm[4]*w.x+vm[5]*w.y+vm[6]*w.z+vm[7])/clip_w;
+    return true;
+}
+
+// ── OVERLAY ───────────────────────────────────────────────────────────────────
+HWND g_overlay=nullptr;
+HDC  g_dc=nullptr;
+
+HPEN   penRed, penGreen, penWhite, penOrange;
+HFONT  fntSmall;
+
+void DrawLine2D(HDC dc, Vec2 a, Vec2 b, HPEN pen) {
+    SelectObject(dc,pen);
+    MoveToEx(dc,(int)a.x,(int)a.y,nullptr);
+    LineTo(dc,(int)b.x,(int)b.y);
+}
+
+void DrawBox2D(HDC dc, Vec2 top, float w, float h, HPEN pen) {
+    DrawLine2D(dc,{top.x-w/2,top.y},{top.x+w/2,top.y},pen);
+    DrawLine2D(dc,{top.x-w/2,top.y+h},{top.x+w/2,top.y+h},pen);
+    DrawLine2D(dc,{top.x-w/2,top.y},{top.x-w/2,top.y+h},pen);
+    DrawLine2D(dc,{top.x+w/2,top.y},{top.x+w/2,top.y+h},pen);
+}
+
+void DrawText2D(HDC dc, Vec2 pos, const char* text, COLORREF col) {
+    SetTextColor(dc,col); SetBkMode(dc,TRANSPARENT);
+    SelectObject(dc,fntSmall);
+    TextOutA(dc,(int)pos.x,(int)pos.y,text,(int)strlen(text));
+}
+
+// ── CONFIG READER ─────────────────────────────────────────────────────────────
+void LoadConfig() {
+    char tmp[MAX_PATH]; GetTempPathA(MAX_PATH,tmp);
+    std::string path=std::string(tmp)+"r6_cfg.txt";
+    if(!std::filesystem::exists(path)) return;
+    std::ifstream f(path); std::string line;
+    // reset
+    g_features={};
+    while(std::getline(f,line)) {
+        if(line.find("ESP — Player Boxes")    !=std::string::npos) g_features.espBoxes=true;
+        if(line.find("ESP — Health Bars")     !=std::string::npos) g_features.espHealth=true;
+        if(line.find("ESP — Distance")        !=std::string::npos) g_features.espDistance=true;
+        if(line.find("ESP — Skeleton")        !=std::string::npos) g_features.espSkeleton=true;
+        if(line.find("Aimbot — Closest")      !=std::string::npos) g_features.aimbotClosest=true;
+        if(line.find("Aimbot — Silent")       !=std::string::npos) g_features.aimbotSilent=true;
+        if(line.find("No Recoil")             !=std::string::npos) g_features.noRecoil=true;
+        if(line.find("Rapid Fire")            !=std::string::npos) g_features.rapidFire=true;
+        if(line.find("No Spread")             !=std::string::npos) g_features.noSpread=true;
+        if(line.find("No Flash")              !=std::string::npos) g_features.noFlash=true;
+        if(line.find("Speed Boost")           !=std::string::npos) g_features.speedBoost=true;
+        if(line.find("Low Gravity")           !=std::string::npos) g_features.lowGravity=true;
+        if(line.find("Wallhack")              !=std::string::npos) g_features.wallhack=true;
+        if(line.find("1-Shot")                !=std::string::npos) g_features.oneShotMult=true;
+    }
+    std::filesystem::remove(path);
+}
+
+// ── MAIN CHEAT LOOP ───────────────────────────────────────────────────────────
+void CheatLoop() {
+    while(true) {
+        LoadConfig();
+
+        float vm[16];
+        ReadProcessMemory(GetCurrentProcess(),(LPCVOID)(g_base+Off::ViewMatrix),vm,sizeof(vm),nullptr);
+
+        uintptr_t localEnt = Rd<uintptr_t>(g_base+Off::LocalPlayer);
+        int localTeam      = localEnt ? Rd<int>(localEnt+Off::EntityTeam) : -1;
+        Vec3 localPos      = localEnt ? Rd<Vec3>(localEnt+Off::EntityPos) : Vec3{};
+        Angles curAng      = Rd<Angles>(g_base+Off::ViewAngles);
+
+        float  bestAimDist = 999999.f;
+        Angles bestAimAng  = curAng;
+        bool   foundTarget = false;
+
+        // Clear overlay
+        if(g_dc) {
+            RECT rc{0,0,g_SW,g_SH};
+            FillRect(g_dc,(LPRECT)&rc,(HBRUSH)GetStockObject(BLACK_BRUSH));
+        }
+
+        for(int i=0;i<Off::MaxEntities;i++) {
+            uintptr_t ent = Rd<uintptr_t>(g_base+Off::EntityList+i*Off::Stride);
+            if(!ent) continue;
+
+            int hp   = Rd<int>(ent+Off::EntityHP);
+            int team = Rd<int>(ent+Off::EntityTeam);
+            if(hp<=0||hp>100||team==localTeam) continue;
+
+            Vec3 pos = Rd<Vec3>(ent+Off::EntityPos);
+            Vec3 head = {pos.x, pos.y, pos.z+75.f};
+            Vec3 feet = {pos.x, pos.y, pos.z-10.f};
+
+            Vec2 headS{}, feetS{};
+            bool headVis = W2S(vm,head,headS);
+            bool feetVis = W2S(vm,feet,feetS);
+
+            float dist = sqrtf(powf(pos.x-localPos.x,2)+powf(pos.y-localPos.y,2)+powf(pos.z-localPos.z,2));
+
+            // ── ESP ─────────────────────────────────────────────────────────
+            if(g_dc && headVis && feetVis) {
+                float boxH = feetS.y - headS.y;
+                float boxW = boxH * 0.45f;
+
+                if(g_features.espBoxes)
+                    DrawBox2D(g_dc,headS,boxW,boxH,penRed);
+
+                if(g_features.espHealth) {
+                    float hFrac = hp/100.f;
+                    Vec2 barTop={headS.x+boxW/2+4, headS.y};
+                    DrawLine2D(g_dc,barTop,{barTop.x,barTop.y+boxH},penRed);
+                    DrawLine2D(g_dc,barTop,{barTop.x,barTop.y+boxH*hFrac},penGreen);
+                }
+
+                if(g_features.espDistance) {
+                    char buf[32]; sprintf_s(buf,"%.0fm",dist/100.f);
+                    DrawText2D(g_dc,{headS.x-8,headS.y-16},buf,RGB(255,255,255));
+                }
+            }
+
+            // ── AIMBOT ───────────────────────────────────────────────────────
+            if(g_features.aimbotClosest || g_features.aimbotSilent) {
+                if(GetAsyncKeyState(VK_RBUTTON)&0x8000) {
+                    float dx=head.x-localPos.x, dy=head.y-localPos.y, dz=head.z-localPos.z;
+                    float d3=sqrtf(dx*dx+dy*dy+dz*dz);
+                    if(d3<bestAimDist) {
+                        bestAimDist=d3;
+                        constexpr float PI=3.14159265f;
+                        bestAimAng.pitch = -asinf(dz/d3)*(180.f/PI);
+                        bestAimAng.yaw   =  atan2f(dy,dx)*(180.f/PI);
+                        while(bestAimAng.yaw> 180.f) bestAimAng.yaw-=360.f;
+                        while(bestAimAng.yaw<-180.f) bestAimAng.yaw+=360.f;
+                        foundTarget=true;
+                    }
+                }
+            }
+
+            // ── 1-SHOT ───────────────────────────────────────────────────────
+            if(g_features.oneShotMult)
+                Wr<float>(ent+Off::EntityHP, 1.f);
+        }
+
+        // Apply aimbot
+        if(foundTarget && (g_features.aimbotClosest||g_features.aimbotSilent)) {
+            const float smooth=0.3f;
+            Angles out;
+            out.pitch=curAng.pitch+(bestAimAng.pitch-curAng.pitch)*smooth;
+            out.yaw  =curAng.yaw  +(bestAimAng.yaw  -curAng.yaw  )*smooth;
+            Wr<Angles>(g_base+Off::ViewAngles,out);
+        }
+
+        // ── WEAPON PATCHES ────────────────────────────────────────────────────
+        if(localEnt) {
+            if(g_features.noRecoil)  Wr<float>(localEnt+Off::Recoil,  0.f);
+            if(g_features.noSpread)  Wr<float>(localEnt+Off::Spread,  0.f);
+            if(g_features.rapidFire) Wr<float>(localEnt+Off::FireRate, 0.001f);
+        }
+
+        // Refresh overlay
+        if(g_overlay) InvalidateRect(g_overlay,nullptr,TRUE);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// ── OVERLAY WINDOW PROC ───────────────────────────────────────────────────────
+LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if(msg==WM_PAINT) {
+        PAINTSTRUCT ps; HDC dc=BeginPaint(hwnd,&ps);
+        // overlay already drawn in CheatLoop via g_dc
+        EndPaint(hwnd,&ps); return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+DWORD WINAPI MainThread(LPVOID) {
+    // Get base
+    MODULEINFO mi{};
+    GetModuleInformation(GetCurrentProcess(),GetModuleHandle(nullptr),&mi,sizeof(mi));
+    g_base=(uintptr_t)mi.lpBaseOfDll;
+
+    // Get screen res
+    g_SW=GetSystemMetrics(SM_CXSCREEN);
+    g_SH=GetSystemMetrics(SM_CYSCREEN);
+
+    // Create overlay
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc=OverlayProc; wc.lpszClassName=L"R6OVL";
+    RegisterClassExW(&wc);
+    g_overlay=CreateWindowExW(
+        WS_EX_TOPMOST|WS_EX_TRANSPARENT|WS_EX_LAYERED,
+        L"R6OVL",L"",WS_POPUP,0,0,g_SW,g_SH,
+        nullptr,nullptr,nullptr,nullptr);
+    SetLayeredWindowAttributes(g_overlay,RGB(0,0,0),0,LWA_COLORKEY);
+    ShowWindow(g_overlay,SW_SHOW);
+    g_dc=GetDC(g_overlay);
+
+    // GDI objects
+    penRed    = CreatePen(PS_SOLID,2,RGB(255,60,60));
+    penGreen  = CreatePen(PS_SOLID,2,RGB(60,255,120));
+    penWhite  = CreatePen(PS_SOLID,1,RGB(255,255,255));
+    penOrange = CreatePen(PS_SOLID,2,RGB(255,160,0));
+    fntSmall  = CreateFontA(12,0,0,0,FW_BOLD,0,0,0,0,0,0,0,0,"Consolas");
+
+    // Cheat thread
+    std::thread(CheatLoop).detach();
+
+    // Message loop for overlay
+    MSG msg{};
+    while(GetMessageW(&msg,nullptr,0,0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    return 0;
+}
+
+BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
+    if(reason==DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hMod);
+        CreateThread(nullptr,0,MainThread,nullptr,0,nullptr);
+    }
+    return TRUE;
+}
+xml
+<!-- R6Loader/R6Loader.csproj -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <AssemblyName>R6Loader</AssemblyName>
+  </PropertyGroup>
+</Project>
+bat
+@echo off
+REM build.bat
+REM Req: .NET 8 SDK, VS 2022 C++ workload
+
+echo [*] Building C# loader...
+dotnet publish R6Loader\R6Loader.csproj ^
+  -c Release -r win-x64 ^
+  --self-contained true ^
+  -p:PublishSingleFile=true ^
+  -o dist\
+
+echo [*] Building payload DLL...
+cl.exe /LD /O2 /std:c++17 ^
+  r6_payload\dllmain.cpp ^
+  /Fe:dist\r6_payload.dll ^
+  /link d3d11.lib dxgi.lib dwmapi.lib psapi.lib
+
+echo [*] Done — dist\R6Loader.exe + dist\r6_payload.dll
+pause
